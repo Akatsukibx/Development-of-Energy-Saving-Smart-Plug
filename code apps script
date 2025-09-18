@@ -1,4 +1,5 @@
 /************* CONFIG *************/
+// ค่าคงที่: ตั้งชื่อชีต, รหัสลับสำหรับตรวจสอบสิทธิ์ (EXPECTED), และโซนเวลา
 const DATA_SHEET    = 'Data';
 const LOG_SHEET     = 'Log';
 const SUMMARY_SHEET = 'Summary';
@@ -6,67 +7,82 @@ const EXPECTED      = 'Smart_Plug';
 const TZ            = 'Asia/Bangkok';
 
 /************* Entrypoints *************/
+// จุดเข้า Web App: Google จะเรียก doPost/doGet ตามชนิดคำขอ HTTP
+// ทั้งสองฟังก์ชันโยนงานไปที่ handleReq_ พร้อมระบุ method
 function doPost(e){ return handleReq_(e, 'POST'); }
 function doGet(e){  return handleReq_(e, 'GET');  }
 
 /************* Main *************/
+// ตัวควบคุมหลักของระบบ: เตรียมชีต, parse payload, ตรวจ secret, route การทำงาน,
+// เขียนข้อมูลลง Data/Summary, และส่งผลลัพธ์กลับ
 function handleReq_(e, method){
+  // เปิดสเปรดชีตและเตรียมชีตย่อย (สร้างใหม่ถ้าไม่พบ)
   const ss     = SpreadsheetApp.getActive();
   const dataSh = ss.getSheetByName(DATA_SHEET)    || ss.insertSheet(DATA_SHEET);
   const sumSh  = ss.getSheetByName(SUMMARY_SHEET) || ss.insertSheet(SUMMARY_SHEET);
   const logSh  = ss.getSheetByName(LOG_SHEET)     || ss.insertSheet(LOG_SHEET);
 
+  // ให้แน่ใจว่ามีหัวคอลัมน์ครบถ้วนในแต่ละชีต
   ensureDataHeader_(dataSh);
   ensureSummaryHeader_(sumSh);
   ensureLogHeader_(logSh);
 
   // --- Parse payload ---
+  // รองรับทั้ง JSON body, query parameter (e.parameter), และ raw/plain (CSV หรือ a=b&c=d)
   const safe    = e || {};
   const headers = safe.headers || {};
   const ctHdr   = String(headers['content-type'] || headers['Content-Type'] || (safe.postData && safe.postData.type) || '').toLowerCase();
   const raw     = (safe.postData && safe.postData.contents) || '';
   let d = {};
   try {
+    // 1) พยายาม parse JSON
     try { d = JSON.parse(raw || '{}'); } catch (_) {}
+    // 2) ถ้าไม่ได้และมีพารามิเตอร์ → ใช้ e.parameter
     if (!Object.keys(d).length && safe.parameter && Object.keys(safe.parameter).length) d = safe.parameter;
+    // 3) ถ้ายังไม่ได้และมี raw → parse แบบ plain (CSV หรือ a=b)
     if (!Object.keys(d).length && raw) d = parsePlain_(raw);
   } catch (err) {
+    // parse ไม่สำเร็จ → บันทึก log แล้วตอบ BAD_PAYLOAD
     log_(logSh, method, 'parse-error', String(err), raw);
     return txt_('BAD_PAYLOAD');
   }
 
   // --- Auth ---
+  // ตรวจรหัสลับจาก Header (X-Secret) หรือฟิลด์ k/K ใน body/parameter แล้วเทียบกับ EXPECTED
   const secret = headers['x-secret'] || headers['X-Secret'] || (d.k || d.K) ||
                  (safe.parameter && (safe.parameter.k || safe.parameter.K)) || '';
   const ok = EXPECTED ? (secret === EXPECTED) : true;
+  // log บันทึกชนิด content-type + สถานะ secret (ok/bad) + ตัวอย่าง payload
   log_(logSh, method, 'ct='+ctHdr, 'secret='+(ok?'ok':'bad'), raw || JSON.stringify(d));
-  if (!ok) return txt_('FORBIDDEN');
+  if (!ok) return txt_('FORBIDDEN'); // ไม่ผ่านสิทธิ์
 
+  // พารามิเตอร์ควบคุม route เช่น pull_state, peak_today, weekly, monthly ฯลฯ
   const ctParam = String((d.ct || (safe.parameter && safe.parameter.ct) || '')).trim().toLowerCase();
 
   /************* READ-ONLY ROUTES *************/
-  // pull last meaningful state (กันกรณีเพิ่งตัดรอบแล้วค่าเป็น 0)
+  // ดึงสถานะล่าสุดที่ "มีความหมาย" (กันกรณีเพิ่งรีเซ็ตแล้วค่าปัจจุบันเป็น 0)
   if (ctParam === 'pull_state' || ctParam === 'last') {
     const latest = latestFromData_(dataSh);
     return json_(latest || { ok:false, reason:'NO_DATA' });
   }
 
-  // peak window of today (เช่น 30 นาที)
+  // หาช่วงเวลา peak ของ "วันนี้" ด้วยหน้าต่าง 30 นาที (คำนวณจาก Data)
   if (ctParam === 'peak_today') {
     const res = peakTodayWindowFromData_(dataSh, 30);
     return json_(res);
   }
 
-  // (optional) peak by ymd=YYYYMMDD
+  // หาช่วง peak ตามวันระบุ (ymd=YYYYMMDD) ใช้หน้าต่าง 30 นาที
   if (ctParam === 'peak_by_ymd') {
     const ymd = String(d.ymd || (safe.parameter && safe.parameter.ymd) || '');
     const res = peakWindowByYmd_(dataSh, ymd, 30);
     return json_(res);
   }
 
-  // weekly/monthly summary trigger — ให้ชีตคำนวณเองจาก Summary!
+  // Trigger สรุปรายสัปดาห์/รายเดือน: ให้ชีต Summary เป็นแหล่งข้อมูล แล้วคำนวณรวม N วันล่าสุดเทียบ N วันก่อน
   if (ctParam === 'weekly') {
     const wk = computeWeeklySummaryFromSheet_(sumSh);
+    // บันทึกข้อความสรุปและตัวเลขสำคัญลง Log
     log_(logSh, 'WEEKLY_AUTO', wk.text, JSON.stringify({ thisWh:wk.thisWh, prevWh:wk.prevWh, days:wk.days }));
     return json_(wk);
   }
@@ -77,16 +93,17 @@ function handleReq_(e, method){
   }
 
   /************* WRITE DATA (live telemetry) *************/
+  // หากไม่ได้เรียกเส้นทาง read-only ด้านบน → ถือว่าเป็นการ "ส่งเทเลเมทรี" ปกติ
   const now   = new Date();
   const ymd   = Utilities.formatDate(now, TZ, 'yyyy-MM-dd');
 
-  // รวม peak ของวันนี้ (จากเดิมในชีต + ค่าที่เข้ามารอบนี้ + dWh ปัจจุบัน)
+  // รวมค่า peak ของ "วันนี้": พิจารณา (1) ค่าที่อยู่ในชีตล่าสุด, (2) peak ที่ส่งมา, (3) dWh ปัจจุบัน
   const prevPeakToday = readLastPeakToday_(dataSh, ymd);
   const dWhNow        = num_(d.dWh) || 0;
   const incomingPeak  = Number(d.peakdailyWh || 0);
   const peakToday     = Math.max(dWhNow, incomingPeak, prevPeakToday);
 
-  // append Data row
+  // บันทึก 1 แถวลง Data ตามลำดับคอลัมน์หัวตาราง (อ่านง่ายและครบถ้วน)
   const row = [
     now,
     onoff_(d.swA), onoff_(d.swB),
@@ -102,20 +119,22 @@ function handleReq_(e, method){
     peakToday
   ];
   dataSh.appendRow(row);
-  SpreadsheetApp.flush();
+  SpreadsheetApp.flush(); // ยืนยันการเขียน
 
-  // บันทึก Summary “เฉพาะตอนตัดรอบ” (วันละ 1 แถว) + peak ของวัน
+  // บันทึก Summary เฉพาะตอน "ตัดรอบรายวัน" (วันละ 1 แถว) และใส่ค่า peak ของวัน
   appendSummary_ON_CUT_ONLY_(sumSh, d, dataSh);
 
-  // (optional logging)
+  // (optional) ถ้า payload ใส่ ct=summary → เก็บข้อความสรุป/คำแนะนำใน Log
   if (String(d.ct || '') === 'summary') {
     log_(logSh, 'SUMMARY', d.dailySummary || '', d.adviceSummary || '');
   }
 
+  // ส่งสัญญาณสำเร็จกลับไปยังผู้เรียก
   return txt_('OK');
 }
 
 /************* Headers *************/
+// สร้าง/เติมหัวคอลัมน์ของชีต Data ให้ครบตามลำดับ (ถ้ายังไม่มี)
 function ensureDataHeader_(sh){
   const want = [
     'ts','swA','swB','iIn','vIn','vA','vB','iA','iB','pA','pB',
@@ -133,8 +152,9 @@ function ensureDataHeader_(sh){
     }
   }
 }
+// สร้าง/เติมหัวคอลัมน์ของชีต Summary: เก็บค่าใช้ไฟวันละแถว + peak และ tips
 function ensureSummaryHeader_(sh){
-  // A..J
+  // A..J = ts, dailyWh, dailyWhPrev, weeklyWh, weeklyWhPrev, monthWh, monthWhPrev, peakdailyWh, peakmonthWh, tips
   const want = ['ts','dailyWh','dailyWhPrev','weeklyWh','weeklyWhPrev','monthWh','monthWhPrev','peakdailyWh','peakmonthWh','tips'];
   if (sh.getLastRow() === 0){
     sh.appendRow(want);
@@ -145,6 +165,7 @@ function ensureSummaryHeader_(sh){
     sh.getRange(1, header.length+1, 1, want.length-header.length).setValues([want.slice(header.length)]);
   }
 }
+// สร้างหัวคอลัมน์ของชีต Log: ใช้บันทึกเหตุการณ์สำคัญ/ข้อผิดพลาด
 function ensureLogHeader_(sh){
   if (sh.getLastRow() === 0){
     sh.appendRow(['ts','method','tag','info']);
@@ -152,9 +173,11 @@ function ensureLogHeader_(sh){
 }
 
 /************* Summary writer (daily cut only) *************/
+// เขียนแถวสรุปลง Summary เฉพาะตอน "ตัดรอบวัน": dWh≈0 และ dWhPrev>0
 function appendSummary_ON_CUT_ONLY_(sh, d, dataSh){
   const near0 = v => Math.abs(Number(v)||0) < 1e-6;
 
+  // ค่า ณ ขณะนี้กับค่า Prev ที่แนบมาจากอุปกรณ์
   const dWh      = Number(d.dWh)||0;
   const dWhPrev  = Number(d.dWhPrev||0);
   const wWh      = Number(d.wWh)||0;
@@ -162,20 +185,22 @@ function appendSummary_ON_CUT_ONLY_(sh, d, dataSh){
   const mWh      = Number(d.mWh)||0;
   const mWhPrev  = Number(d.mWhPrev)||0;
 
-  // เฉพาะตอน “ตัดรอบวัน” เท่านั้น: dWh ≈ 0 และ dWhPrev > 0
+  // เงื่อนไข "ตัดรอบวัน": dWh ใกล้ 0 และ dWhPrev มีค่า → เพิ่งรีเซ็ตวันใหม่
   const isCut = ( near0(dWh) && !near0(dWhPrev) );
   if (!isCut) return;
 
+  // เลือกค่าที่จะบันทึกลง Summary ของวันนั้น
   const dailyEff   = dWhPrev;
   const weeklyEff  = !near0(wWh) ? wWh : ( !near0(wWhPrev) ? wWhPrev : dWhPrev );
   const monthlyEff = !near0(mWh) ? mWh : ( !near0(mWhPrev) ? mWhPrev : 0 );
 
+  // วันที่ปัจจุบัน + คำนวณ peak รายวันจากชีต Data (รวมค่าที่บันทึกก่อนหน้า)
   const now  = new Date();
   const ymd  = Utilities.formatDate(now, TZ, 'yyyy-MM-dd');
   const peakD = calcPeakDailyForYmd_(dataSh, ymd);
-  const peakM = Number(d.peakmonthWh || 0); // เผื่อในอนาคต
+  const peakM = Number(d.peakmonthWh || 0); // รองรับการใช้งานอนาคต
 
-  // อัปเดตแถวของวันนี้ถ้ามีอยู่แล้ว (วันละแถวเดียว)
+  // ถ้าวันนี้มีแถวอยู่แล้ว → อัปเดตทับ, ถ้ายังไม่มี → เพิ่มใหม่
   const map = { ts:1 };
   const rowIndex = getSummaryRowIndex_(sh, ymd, map);
   if (rowIndex > 0){
@@ -185,27 +210,30 @@ function appendSummary_ON_CUT_ONLY_(sh, d, dataSh){
     return;
   }
 
-  // ยังไม่มี → เพิ่มใหม่
+  // เพิ่มแถวใหม่สำหรับวันนี้
   sh.appendRow([ymd, dailyEff, dWhPrev, weeklyEff, wWhPrev, monthlyEff, mWhPrev, peakD, peakM, String(d.adviceSummary || '')]);
 }
 
 /************* Peak helpers *************/
+// อ่านค่า peakdailyWh ของ "แถวล่าสุด" หากยังเป็นวันเดียวกัน; ไม่ใช่วันเดียวกันให้ 0
 function readLastPeakToday_(sh, ymdStr){
   const lastRow = sh.getLastRow();
   if (lastRow < 2) return 0;
   const lastTs = sh.getRange(lastRow, 1).getValue();
   const lastYmd = cellToYmd_(lastTs);
   if (lastYmd !== ymdStr) return 0;
-  const lastPeak = Number(sh.getRange(lastRow, 22).getValue() || 0); // V
+  const lastPeak = Number(sh.getRange(lastRow, 22).getValue() || 0); // คอลัมน์ที่ 22 = peakdailyWh
   return lastPeak || 0;
 }
+// คำนวณค่า peak สูงสุดของวัน ymd จากทั้งคอลัมน์ dailyWh และ peakdailyWh
 function calcPeakDailyForYmd_(dataSh, ymdStr){
   const lastRow = dataSh.getLastRow();
   if (lastRow < 2) return 0;
   const tsCol = dataSh.getRange(2, 1,  lastRow-1, 1).getValues(); // ts
-  const pCol  = dataSh.getRange(2, 16, lastRow-1, 1).getValues(); // dailyWh (P)
-  const vCol  = dataSh.getRange(2, 22, lastRow-1, 1).getValues(); // peakdailyWh (V)
+  const pCol  = dataSh.getRange(2, 16, lastRow-1, 1).getValues(); // dailyWh (คอลัมน์ที่ 16)
+  const vCol  = dataSh.getRange(2, 22, lastRow-1, 1).getValues(); // peakdailyWh (คอลัมน์ที่ 22)
   let peak = 0;
+  // ไล่หา max จาก dailyWh ของวันนั้น
   for (let i=0;i<tsCol.length;i++){
     const ymd = cellToYmd_(tsCol[i][0]);
     if (ymd === ymdStr){
@@ -213,6 +241,7 @@ function calcPeakDailyForYmd_(dataSh, ymdStr){
       if (dwh > peak) peak = dwh;
     }
   }
+  // ไล่หา max จาก peakdailyWh ที่เคยบันทึกไว้
   for (let i=0;i<tsCol.length;i++){
     const ymd = cellToYmd_(tsCol[i][0]);
     if (ymd === ymdStr){
@@ -224,6 +253,8 @@ function calcPeakDailyForYmd_(dataSh, ymdStr){
 }
 
 /************* Peak window (today/by ymd) *************/
+// คำนวณ "ช่วงเวลาพีค" ของวันนี้ ด้วยหน้าต่าง WMIN นาที (default 30)
+// สร้างชุดข้อมูลต่อนาทีจากกราฟ dWh สะสม แล้วหา subwindow ที่ผลรวมเพิ่มขึ้นสูงสุด
 function peakTodayWindowFromData_(sh, windowMin){
   const WMIN = windowMin || 30;
   const now  = new Date();
@@ -248,6 +279,7 @@ function peakTodayWindowFromData_(sh, windowMin){
   }
   return peakWindowFromRows_(rows, WMIN);
 }
+// คำนวณ "ช่วงเวลาพีค" สำหรับวัน ymd ที่ระบุ
 function peakWindowByYmd_(sh, ymdStr, windowMin){
   const WMIN = windowMin || 30;
 
@@ -270,26 +302,29 @@ function peakWindowByYmd_(sh, ymdStr, windowMin){
   }
   return peakWindowFromRows_(rows, WMIN);
 }
+// อัลกอริทึมสไลด์วินโดว์: แตกข้อมูลเป็นรายนาทีจากความต่างของ dWh ระหว่างจุดติดกัน
+// แล้วสไลด์หน้าต่าง WMIN นาทีเพื่อหาผลรวมการเพิ่มขึ้นสูงสุด (avgWh = ผลรวมในหน้าต่าง)
 function peakWindowFromRows_(rows, WMIN){
   if (rows.length < 2) return { ok:false, reason:'NOT_ENOUGH' };
   // แตกเป็น “นาที” + ปริมาณพลังงานเพิ่มขึ้นต่อหนึ่งนาที
   const mins = [];
   for (let i=1;i<rows.length;i++){
     const prev = rows[i-1], cur = rows[i];
-    let inc = cur.dwh - prev.dwh; if (inc < 0) inc = 0;
-    const dtMin = Math.max(1, Math.round((cur.t - prev.t)/60000));
-    const perMin = inc / dtMin;
+    let inc = cur.dwh - prev.dwh; if (inc < 0) inc = 0; // ป้องกันกรณีรีเซ็ต
+    const dtMin = Math.max(1, Math.round((cur.t - prev.t)/60000)); // จำนวน "นาที" ระหว่างสองจุด
+    const perMin = inc / dtMin; // เฉลี่ยต่อ 1 นาที
     for (let k=0;k<dtMin;k++){
       mins.push({ t: new Date(prev.t.getTime() + (k+1)*60000), inc: perMin });
     }
   }
   if (!mins.length) return { ok:false, reason:'NO_MIN_SAMPLES' };
 
-  // สไลด์วินโดว์
+  // สไลด์วินโดว์เพื่อหาผลรวม inc สูงสุดภายในช่วงเวลา WMIN นาที
   let bestSum = 0, bestStart = mins[0].t;
   let sum = 0, L = 0;
   for (let R=0; R<mins.length; R++){
     sum += mins[R].inc;
+    // บีบหน้าต่างให้ความยาว < WMIN นาทีเสมอ
     while ((mins[R].t - mins[L].t) >= WMIN*60000){
       sum -= mins[L].inc; L++;
     }
@@ -304,10 +339,11 @@ function peakWindowFromRows_(rows, WMIN){
 }
 
 /************* Weekly/Monthly calculators (sheet-driven) *************/
+// ผู้ช่วยรวมค่า N วันล่าสุดเทียบ N วันก่อนหน้า จากชีต Summary (ใช้คอลัมน์ dailyWh)
 function sumWithPrevDays_(sumSh, N){
   const lastRow = sumSh.getLastRow();
   if (lastRow < 2) return { thisSum:0, prevSum:0, count:0 };
-  // อ่านคอลัมน์ B: dailyWh ล่าสุด 2N แถว
+  // อ่านคอลัมน์ B: dailyWh ย้อนหลัง 2N แถวล่าสุด
   const take = Math.min(2*N, lastRow - 1);
   const vals = sumSh.getRange(lastRow - take + 1, 2, take, 1).getValues();
   const arr  = vals.map(r => Number(r[0] || 0));
@@ -316,18 +352,22 @@ function sumWithPrevDays_(sumSh, N){
   const sum = a => a.reduce((s,x)=>s+(Number(x)||0), 0);
   return { thisSum: sum(thisSlice), prevSum: sum(prevSlice), count: thisSlice.length };
 }
+// แปลง Wh → “หน่วย” (kWh) พร้อมทศนิยม digits
 function makeThaiUnits_(wh, digits){ return ((Number(wh)||0)/1000).toFixed(digits) + ' หน่วย'; }
+// สร้างข้อความเปอร์เซ็นต์เพิ่มขึ้น/ลดลง เทียบช่วงก่อน
 function fmtPct_(cur, prev){
   if (!prev || prev <= 0) return '0% (ช่วงแรก)';
   const pct = Math.round(Math.abs((cur - prev)/prev)*100);
   return (cur >= prev ? 'เพิ่มขึ้น ' : 'ลดลง ') + pct + '%';
 }
+// สรุปค่าใช้ไฟรายสัปดาห์ (7 วันล่าสุดเทียบ 7 วันก่อนหน้า)
 function computeWeeklySummaryFromSheet_(sumSh){
   const N = 7;
   const { thisSum, prevSum, count } = sumWithPrevDays_(sumSh, N);
   const text = `ใช้ไฟสัปดาห์นี้: ${makeThaiUnits_(thisSum, 2)} ${fmtPct_(thisSum, prevSum)} | แนะนำ: ปิดอุปกรณ์ที่ไม่ใช้`;
   return { ok:true, thisWh:thisSum, prevWh:prevSum, days:count, text };
 }
+// สรุปค่าใช้ไฟรายเดือน (30 วันล่าสุดเทียบ 30 วันก่อนหน้า)
 function computeMonthlySummaryFromSheet_(sumSh){
   const N = 30;
   const { thisSum, prevSum, count } = sumWithPrevDays_(sumSh, N);
@@ -336,12 +376,13 @@ function computeMonthlySummaryFromSheet_(sumSh){
 }
 
 /************* Latest pull (robust, lookback) *************/
+// ดึงสถานะล่าสุดแบบทนทาน: มองย้อน LOOKBACK แถว เพื่อเลือกค่า d/w/m ที่ไม่ศูนย์ (หรือ prev ล่าสุด)
 function latestFromData_(sh){
   const lastRow = sh.getLastRow();
   if (lastRow < 2) return null;
 
   const lastCol  = sh.getLastColumn();
-  const LOOKBACK = Math.min(2000, lastRow - 1); // ~1.5 วัน (ส่งทุกนาที)
+  const LOOKBACK = Math.min(2000, lastRow - 1); // ~1.5 วัน (หากส่งทุกนาที)
   const startRow = lastRow - LOOKBACK + 1;
   const rows     = sh.getRange(startRow, 1, LOOKBACK, lastCol).getValues();
 
@@ -357,14 +398,17 @@ function latestFromData_(sh){
     const monthWh       = Number(row[19] || 0);
     const monthWhPrev   = Number(row[20] || 0);
 
+    // จดจำ prev ล่าสุดเพื่อใช้สำรองเมื่อค่าปัจจุบันเป็น 0
     if (dailyWhPrev  > 0 && lastPrevD === 0) lastPrevD = dailyWhPrev;
     if (weeklyWhPrev > 0 && lastPrevW === 0) lastPrevW = weeklyWhPrev;
     if (monthWhPrev  > 0 && lastPrevM === 0) lastPrevM = monthWhPrev;
 
+    // เลือกค่าที่ "มีความหมาย" (ถ้าค่าปัจจุบันเป็น 0 ให้ fallback ไป prev)
     const effDaily   = dailyWh  > 0 ? dailyWh  : (dailyWhPrev  > 0 ? dailyWhPrev  : 0);
     const effWeekly  = weeklyWh > 0 ? weeklyWh : (weeklyWhPrev > 0 ? weeklyWhPrev : 0);
     const effMonthly = monthWh  > 0 ? monthWh  : (monthWhPrev  > 0 ? monthWhPrev  : 0);
 
+    // พบค่าใดค่าหนึ่งที่ใช้ได้ → จัดรูป ISO เวลาและคืนผล
     if (effDaily > 0 || effWeekly > 0 || effMonthly > 0 ||
         dailyWhPrev > 0 || weeklyWhPrev > 0 || monthWhPrev > 0) {
 
@@ -388,10 +432,15 @@ function latestFromData_(sh){
 }
 
 /************* Utils *************/
+// แปลงเป็น Number เมื่อมีค่า; ถ้าเป็นค่าว่าง/undefined ให้คงเป็น '' (กัน NaN ในชีต)
 function num_(x){ return (x === '' || x === null || x === undefined) ? '' : Number(x); }
+// true/false แบบยืดหยุ่น (รองรับ true/1/'1'/'true'/'เปิด'/'ตัดแล้ว')
 function isTrue_(v){ return v===true || v===1 || v==='1' || String(v).toLowerCase()==='true' || v==='เปิด' || v==='ตัดแล้ว'; }
+// แปลงเป็น 'เปิด'/'ปิด' เพื่อบันทึกในชีตให้อ่านง่าย
 function onoff_(v){ return isTrue_(v) ? 'เปิด' : 'ปิด'; }
+// แปลงสถานะ trip เป็นข้อความภาษาไทย
 function tripText_(v){ return isTrue_(v) ? 'ตัดแล้ว' : 'ปกติ'; }
+// ตัว parser แบบ plain: รองรับ CSV 21 ฟิลด์ (ชุดเต็ม) หรือรูป a=b&c=d (และบรรทัดใหม่)
 function parsePlain_(raw){
   // รองรับทั้ง a=b&c=d และ CSV 'a,b,c,...' (ถ้าจำนวนฟิลด์ >= 21 คือชุดเต็ม)
   const res = {};
@@ -415,6 +464,7 @@ function parsePlain_(raw){
   });
   return res;
 }
+// แปลงค่าจากเซลล์ (Date หรือ string) → รูป 'yyyy-MM-dd' ตาม TZ
 function cellToYmd_(v){
   if (v instanceof Date) return Utilities.formatDate(v, TZ, 'yyyy-MM-dd');
   const s = String(v||'').trim();
@@ -422,6 +472,7 @@ function cellToYmd_(v){
   const d = new Date(s); if (!isNaN(d.getTime())) return Utilities.formatDate(d, TZ, 'yyyy-MM-dd');
   return s;
 }
+// ค้นหาแถวของวัน ymd ในชีต Summary (เพื่ออัปเดตทับ ถ้ามีอยู่แล้ว)
 function getSummaryRowIndex_(sh, ymd, map){
   const lastRow = sh.getLastRow();
   if (lastRow < 2) return 0;
@@ -432,8 +483,11 @@ function getSummaryRowIndex_(sh, ymd, map){
   }
   return 0;
 }
+// เขียนบรรทัด Log (เวลา, เมธอด, ป้าย tag, และรายละเอียด)
 function log_(sh, method, tag, info1, info2){
   try{ sh.appendRow([new Date(), method, tag, (info2? (String(info1)+' | '+String(info2)) : String(info1)) ]); }catch(_){}
 }
+// ตัวช่วยส่งข้อความธรรมดา
 function txt_(s){ return ContentService.createTextOutput(String(s)); }
+// ตัวช่วยส่ง JSON (ตั้ง MIME เป็น application/json)
 function json_(o){ return ContentService.createTextOutput(JSON.stringify(o)).setMimeType(ContentService.MimeType.JSON); }
